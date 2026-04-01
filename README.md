@@ -12,4 +12,4 @@ Setup:
 Clone the repo via `git clone https://github.com/YourUsername/repo.git`
 Install dependencies: `pip install -r requirements.txt`
 Create a `.env` file with your `DISCORD_TOKEN` and `MAL_CLIENT_ID`
-Run: `python main.py`
+Run: `python main.py`   
