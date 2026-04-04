@@ -88,7 +88,7 @@ class MyBot(discord.Client):
 
 bot = MyBot()
 
-@bot.tree.command(name="user", description="Link your MyAnimeList username")
+@bot.tree.command(name="user", description="Link your discordid for notifications!")
 async def set_user(interaction: discord.Interaction, username: str):
     conn = get_db_connection()
     c = conn.cursor()
@@ -100,6 +100,18 @@ async def set_user(interaction: discord.Interaction, username: str):
     c.close()
     conn.close()
     await interaction.response.send_message(f"✅ Linked! MAL username set to **{username}**.")
+
+@bot.tree.command(name="help", description="list of commands")
+async def help_command(interaction: discord.Interaction):
+    helpT = """
+    **Available Commands:**
+    - `/user <userid>`: Link your discord username.
+    - `/manga <title>`: Search for a manga.
+    - `/track <title>`: Track a manga for updates (MALBOT will dm you when a new chapter drops!).
+    - `/list`: Show your tracked manga.
+    - `/export`: Export your tracked list as a PDF.
+    """
+    await interaction.response.send_message(helpT)
 
 @bot.tree.command(name="export", description="Export your list as a PDF")
 async def export_pdf(interaction: discord.Interaction):
