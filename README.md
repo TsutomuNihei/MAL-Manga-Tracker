@@ -1,6 +1,7 @@
 MAL-bot is a discord bot that uses MAL API to run commands for general MAL functionality and Manga tracking and exporting
 
 Features:
+Search for manga and anime using "/manga" and "/anime" command
 Automated notification from the bot for manga that have been tracked using "/track" command
 Secure Storage using Supabase as the DB to make discord IDs to their list trackings using "/list" command
 Export manga in a pdf format using "/export"
