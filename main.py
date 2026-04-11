@@ -2,6 +2,9 @@ import discord
 from discord import app_commands
 from discord.ext import tasks
 import os
+import io
+import asyncio
+from urllib.parse import quote
 import aiohttp
 import asyncpg
 from fpdf import FPDF
@@ -16,8 +19,8 @@ DB_CONFIG = {
     'database': os.getenv('DB_NAME'),
     'user':     os.getenv('DB_USER'),
     'password': os.getenv('DB_PASS'),
-    'host':     os.getenv('DB_HOST'),
-    'port':     os.getenv('DB_PORT'),
+    'host':     os.getenv('DB_HOST', 'localhost'),
+    'port':     int(os.getenv('DB_PORT', '5432')),
 }
 
 MAX_TRACKED = 30
@@ -58,6 +61,12 @@ STATUS_MAP = {
     'discontinued':         'Discontinued',
 }
 
+ANIME_STATUS_MAP = {
+    'currently_airing':  'Airing',
+    'finished_airing':   'Finished Airing',
+    'not_yet_aired':     'Not Yet Aired',
+}
+
 
 class MyBot(discord.Client):
     def __init__(self):
@@ -67,6 +76,7 @@ class MyBot(discord.Client):
 
     async def setup_hook(self):
         await init_db()
+        await self.tree.sync()
         self.check_for_updates.start()
 
     @tasks.loop(hours=6)
@@ -127,6 +137,8 @@ class MyBot(discord.Client):
                 except Exception as e:
                     print(f"Error on manga {m_id}: {e}")
 
+                await asyncio.sleep(1)
+
         print("Update check done.")
 
     @check_for_updates.before_loop
@@ -134,7 +146,6 @@ class MyBot(discord.Client):
         await self.wait_until_ready()
 
     async def on_ready(self):
-        await self.tree.sync()
         print(f"Logged in as {self.user} (ID: {self.user.id})")
 
 
@@ -158,14 +169,15 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.tree.command(name="help", description="List all available commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
-        title="MAL Manga Tracker",
-        description="Track manga from MyAnimeList and get DM'd when something updates.",
+        title="MAL Tracker",
+        description="Search manga & anime on MyAnimeList, track manga, and get DM'd when something updates.",
         color=discord.Color.blurple()
     )
     embed.add_field(name="/user <username>",  value="Link your MAL username.",                       inline=False)
     embed.add_field(name="/manga <title>",    value="Search MAL for a manga.",                       inline=False)
+    embed.add_field(name="/anime <title>",    value="Search MAL for an anime.",                      inline=False)
     embed.add_field(name="/track <title>",    value=f"Track a manga (max {MAX_TRACKED} per user).", inline=False)
-    embed.add_field(name="/untrack <title>",  value="Stop tracking a manga.",                        inline=False)
+    embed.add_field(name="/untrack <title>",  value="Stop tracking a manga (autocomplete).",         inline=False)
     embed.add_field(name="/list",             value="See your full tracking list.",                  inline=False)
     embed.add_field(name="/export",           value="Export your tracking list as a PDF.",           inline=False)
     embed.set_footer(text="Updates are checked every 6 hours.")
@@ -199,7 +211,10 @@ async def manga(interaction: discord.Interaction, title: str):
 
     await interaction.response.defer()
 
-    url     = f'https://api.myanimelist.net/v2/manga?q={title}&limit=1&fields=id,title,main_picture,synopsis,status,num_chapters'
+    url = (
+        f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit=1'
+        f'&fields=id,title,main_picture,synopsis,status,num_chapters,mean,authors{{first_name,last_name}}'
+    )
     headers = {'X-MAL-CLIENT-ID': MAL_ID}
 
     async with aiohttp.ClientSession() as session:
@@ -218,6 +233,19 @@ async def manga(interaction: discord.Interaction, title: str):
     chapters = node.get('num_chapters', 0)
     ch_text  = str(chapters) if chapters > 0 else 'Ongoing'
     synopsis = node.get('synopsis', 'No synopsis available.')
+    score    = node.get('mean')
+    score_text = f"{score}/10" if score else 'N/A'
+
+    authors = node.get('authors', [])
+    author_names = []
+    for a in authors:
+        person = a.get('node', {})
+        first  = person.get('first_name', '')
+        last   = person.get('last_name', '')
+        name   = f"{first} {last}".strip()
+        if name:
+            author_names.append(name)
+    author_text = ', '.join(author_names[:3]) if author_names else 'Unknown'
 
     embed = discord.Embed(
         title=node['title'],
@@ -232,8 +260,70 @@ async def manga(interaction: discord.Interaction, title: str):
         value=synopsis[:300] + ("..." if len(synopsis) > 300 else ""),
         inline=False
     )
-    embed.add_field(name="Status",   value=status,  inline=True)
-    embed.add_field(name="Chapters", value=ch_text, inline=True)
+    embed.add_field(name="Status",   value=status,      inline=True)
+    embed.add_field(name="Chapters", value=ch_text,      inline=True)
+    embed.add_field(name="MAL Score", value=score_text,  inline=True)
+    embed.add_field(name="Author",   value=author_text,  inline=True)
+
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="anime", description="Search for an anime on MAL")
+@app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+async def anime(interaction: discord.Interaction, title: str):
+    title = sanitize(title)
+    if not title:
+        await interaction.response.send_message("Give me an actual title.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    url = (
+        f'https://api.myanimelist.net/v2/anime?q={quote(title)}&limit=1'
+        f'&fields=id,title,main_picture,synopsis,status,num_episodes,mean,studios'
+    )
+    headers = {'X-MAL-CLIENT-ID': MAL_ID}
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                await interaction.followup.send("MAL API is not responding right now. Try again later.")
+                return
+            data = await resp.json()
+
+    if not data.get('data'):
+        await interaction.followup.send("Couldn't find that anime on MAL.")
+        return
+
+    node     = data['data'][0]['node']
+    status   = ANIME_STATUS_MAP.get(node.get('status', ''), 'Unknown')
+    episodes = node.get('num_episodes', 0)
+    ep_text  = str(episodes) if episodes > 0 else 'Ongoing'
+    synopsis = node.get('synopsis', 'No synopsis available.')
+    score    = node.get('mean')
+    score_text = f"{score}/10" if score else 'N/A'
+
+    studios = node.get('studios', [])
+    studio_names = [s.get('name', '') for s in studios if s.get('name')]
+    studio_text  = ', '.join(studio_names[:3]) if studio_names else 'Unknown'
+
+    embed = discord.Embed(
+        title=node['title'],
+        url=f"https://myanimelist.net/anime/{node['id']}",
+        color=discord.Color.red()
+    )
+    if 'main_picture' in node:
+        embed.set_thumbnail(url=node['main_picture']['large'])
+
+    embed.add_field(
+        name="Synopsis",
+        value=synopsis[:300] + ("..." if len(synopsis) > 300 else ""),
+        inline=False
+    )
+    embed.add_field(name="Status",    value=status,      inline=True)
+    embed.add_field(name="Episodes",  value=ep_text,     inline=True)
+    embed.add_field(name="MAL Score", value=score_text,  inline=True)
+    embed.add_field(name="Studio",    value=studio_text,  inline=True)
 
     await interaction.followup.send(embed=embed)
 
@@ -259,7 +349,7 @@ async def track(interaction: discord.Interaction, title: str):
         )
         return
 
-    url     = f'https://api.myanimelist.net/v2/manga?q={title}&limit=1&fields=id,title,num_chapters,status,updated_at'
+    url     = f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit=1&fields=id,title,num_chapters,status,updated_at'
     headers = {'X-MAL-CLIENT-ID': MAL_ID}
 
     async with aiohttp.ClientSession() as session:
@@ -293,8 +383,25 @@ async def track(interaction: discord.Interaction, title: str):
         await interaction.followup.send(f"✅ Now tracking **{node['title']}**! I'll DM you when it updates.")
 
 
+async def untrack_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT manga_title FROM tracking WHERE user_id = $1 ORDER BY manga_title",
+            interaction.user.id
+        )
+    choices = []
+    for row in rows:
+        t = row['manga_title']
+        if current.lower() in t.lower():
+            choices.append(app_commands.Choice(name=t[:100], value=t))
+        if len(choices) >= 25:
+            break
+    return choices
+
+
 @bot.tree.command(name="untrack", description="Stop tracking a manga")
 @app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+@app_commands.autocomplete(title=untrack_autocomplete)
 async def untrack(interaction: discord.Interaction, title: str):
     title = sanitize(title)
     if not title:
@@ -303,13 +410,14 @@ async def untrack(interaction: discord.Interaction, title: str):
 
     async with pool.acquire() as conn:
         result = await conn.execute(
-            "DELETE FROM tracking WHERE user_id = $1 AND LOWER(manga_title) LIKE LOWER($2)",
-            interaction.user.id, f"%{title}%"
+            "DELETE FROM tracking WHERE user_id = $1 AND LOWER(manga_title) = LOWER($2)",
+            interaction.user.id, title
         )
 
     if result == "DELETE 0":
         await interaction.response.send_message(
-            f"Couldn't find **{title}** in your list. Use `/list` to see what you're tracking."
+            f"Couldn't find **{title}** in your list. Use `/list` to see what you're tracking.",
+            ephemeral=True
         )
     else:
         await interaction.response.send_message(f"✅ Stopped tracking **{title}**.")
@@ -367,8 +475,7 @@ async def export_pdf(interaction: discord.Interaction):
         await interaction.followup.send("Nothing to export, your list is empty.")
         return
 
-    mal_user  = user_row['mal_username']
-    file_name = f"{interaction.user.id}_list.pdf"
+    mal_user = user_row['mal_username']
 
     try:
         pdf = FPDF()
@@ -387,25 +494,21 @@ async def export_pdf(interaction: discord.Interaction):
         pdf.ln()
 
         pdf.set_font("Arial", "", 11)
-        for title, chapter in rows:
+        for t, chapter in rows:
             ch_text       = str(chapter) if chapter > 0 else "Ongoing"
-            display_title = str(title)[:50] + ("..." if len(str(title)) > 50 else "")
+            display_title = str(t)[:50] + ("..." if len(str(t)) > 50 else "")
             pdf.cell(130, 9, display_title, border=1)
             pdf.cell(50,  9, ch_text,       border=1)
             pdf.ln()
 
-        pdf.output(file_name)
-        await interaction.followup.send(
-            "Here's your exported list!", file=discord.File(file_name)
-        )
+        buf = io.BytesIO(pdf.output())
+        buf.seek(0)
+        file = discord.File(fp=buf, filename=f"{mal_user}_manga_list.pdf")
+        await interaction.followup.send("Here's your exported list!", file=file)
 
     except Exception as e:
         await interaction.followup.send("Something went wrong generating the PDF.")
         print(f"PDF error: {e}")
-
-    finally:
-        if os.path.exists(file_name):
-            os.remove(file_name)
 
 
 bot.run(TOKEN)
