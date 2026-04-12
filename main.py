@@ -57,6 +57,27 @@ def sanitize(text: str, max_len: int = 100) -> str:
 
 
 MAL_SEARCH_LIMIT = 10
+MAL_SEARCH_LIMIT_MEDIA = 30
+MAL_USER_LIST_PAGE = 1000
+MAL_USER_LIST_MAX_PAGES = 5
+
+MAL_MANGA_SEARCH_FIELDS = (
+    "id,title,alternative_titles,media_type,main_picture,synopsis,status,num_chapters,mean,"
+    "authors{first_name,last_name}"
+)
+MAL_MANGA_TRACK_SEARCH_FIELDS = "id,title,alternative_titles,media_type,num_chapters,status,updated_at"
+MAL_MANGA_DETAIL_FIELDS = (
+    "id,title,alternative_titles,media_type,main_picture,synopsis,status,num_chapters,mean,"
+    "authors{first_name,last_name},updated_at"
+)
+
+MAL_ANIME_SEARCH_FIELDS = (
+    "id,title,alternative_titles,main_picture,synopsis,status,num_episodes,mean,studios"
+)
+
+
+def mal_headers() -> dict[str, str]:
+    return {"X-MAL-CLIENT-ID": MAL_ID}
 
 
 def _norm_title(s: str) -> str:
@@ -93,17 +114,20 @@ def _title_similarity(query: str, title: str) -> float:
     return SequenceMatcher(None, nq, nt).ratio()
 
 
-def pick_best_mal_node(nodes: list[dict], query: str) -> tuple[dict | None, bool]:
-    """Pick the best-matching node for ``query``. Returns (node, fuzzy) where
-    ``fuzzy`` is True when no normalized exact match on title or alt names."""
+def pick_best_mal_node(nodes: list[dict], query: str) -> tuple[dict | None, bool, float]:
+    """Pick the best-matching node for ``query``.
+
+    Returns ``(node, fuzzy, score)`` where ``fuzzy`` is False on a normalized
+    exact title/alt match and ``score`` is the best title similarity in ``[0, 1]``.
+    """
     if not nodes:
-        return None, False
+        return None, False, 0.0
     qn = _norm_title(query)
 
     for node in nodes:
         for cand in _titles_from_mal_node(node):
             if _norm_title(cand) == qn:
-                return node, False
+                return node, False, 1.0
 
     ranked: list[tuple[float, int, dict]] = []
     for i, node in enumerate(nodes):
@@ -113,8 +137,150 @@ def pick_best_mal_node(nodes: list[dict], query: str) -> tuple[dict | None, bool
         )
         ranked.append((score, -i, node))
     ranked.sort(reverse=True)
-    _, _, best_node = ranked[0]
-    return best_node, True
+    best_score, _, best_node = ranked[0]
+    return best_node, True, best_score
+
+
+def _filter_nodes_media_type(nodes: list[dict], media: str | None) -> list[dict]:
+    if not media or media == "any":
+        return nodes
+    want = media.lower()
+    out = [n for n in nodes if str(n.get("media_type", "")).lower() == want]
+    return out
+
+
+def _pick_manga_with_media(
+    nodes: list[dict], query: str, media: str | None
+) -> tuple[dict | None, bool, float, bool]:
+    """Like ``pick_best_mal_node`` but respects ``media`` (manhwa/manhua).
+
+    Returns ``(node, fuzzy, score, used_fallback)`` where ``used_fallback`` is
+    True when no rows matched the media filter and the pick used the unfiltered list.
+    """
+    filtered = _filter_nodes_media_type(nodes, media)
+    if filtered:
+        n, fz, sc = pick_best_mal_node(filtered, query)
+        return n, fz, sc, False
+    if media and media != "any":
+        n, fz, sc = pick_best_mal_node(nodes, query)
+        return n, fz, sc, True
+    n, fz, sc = pick_best_mal_node(nodes, query)
+    return n, fz, sc, False
+
+
+async def mal_fetch_json(session: aiohttp.ClientSession, url: str) -> dict | None:
+    async with session.get(url, headers=mal_headers()) as resp:
+        if resp.status != 200:
+            return None
+        return await resp.json()
+
+
+async def mal_fetch_manga_detail(session: aiohttp.ClientSession, manga_id: int) -> dict | None:
+    url = (
+        f"https://api.myanimelist.net/v2/manga/{manga_id}"
+        f"?fields={MAL_MANGA_DETAIL_FIELDS}"
+    )
+    return await mal_fetch_json(session, url)
+
+
+MAL_ANIME_DETAIL_FIELDS = (
+    "id,title,alternative_titles,main_picture,synopsis,status,num_episodes,mean,studios"
+)
+
+
+async def mal_fetch_anime_detail(session: aiohttp.ClientSession, anime_id: int) -> dict | None:
+    url = f"https://api.myanimelist.net/v2/anime/{anime_id}?fields={MAL_ANIME_DETAIL_FIELDS}"
+    return await mal_fetch_json(session, url)
+
+
+async def mal_paginate_user_manga_nodes(session: aiohttp.ClientSession, username: str) -> list[dict]:
+    user_seg = quote(username, safe="-_.~")
+    field_sets = (
+        "id,title,alternative_titles,media_type",
+        "id,title,alternative_titles",
+        "list_status",
+    )
+    for fields in field_sets:
+        chunk: list[dict] = []
+        url = (
+            f"https://api.myanimelist.net/v2/users/{user_seg}/mangalist"
+            f"?nsfw=true&limit={MAL_USER_LIST_PAGE}&offset=0&fields={fields}"
+        )
+        pages = 0
+        ok = False
+        while url and pages < MAL_USER_LIST_MAX_PAGES:
+            data = await mal_fetch_json(session, url)
+            if data is None:
+                break
+            ok = True
+            for item in data.get("data") or []:
+                n = item.get("node")
+                if n and isinstance(n, dict):
+                    chunk.append(n)
+            url = (data.get("paging") or {}).get("next")
+            pages += 1
+            if url:
+                await asyncio.sleep(0.2)
+        if ok:
+            return chunk
+    return []
+
+
+async def mal_paginate_user_anime_nodes(session: aiohttp.ClientSession, username: str) -> list[dict]:
+    user_seg = quote(username, safe="-_.~")
+    field_sets = (
+        "id,title,alternative_titles",
+        "list_status",
+    )
+    for fields in field_sets:
+        chunk: list[dict] = []
+        url = (
+            f"https://api.myanimelist.net/v2/users/{user_seg}/animelist"
+            f"?nsfw=true&limit={MAL_USER_LIST_PAGE}&offset=0&fields={fields}"
+        )
+        pages = 0
+        ok = False
+        while url and pages < MAL_USER_LIST_MAX_PAGES:
+            data = await mal_fetch_json(session, url)
+            if data is None:
+                break
+            ok = True
+            for item in data.get("data") or []:
+                n = item.get("node")
+                if n and isinstance(n, dict):
+                    chunk.append(n)
+            url = (data.get("paging") or {}).get("next")
+            pages += 1
+            if url:
+                await asyncio.sleep(0.2)
+        if ok:
+            return chunk
+    return []
+
+
+def resolve_manga_choice(
+    list_node: dict | None,
+    list_fuzzy: bool,
+    list_score: float,
+    search_node: dict | None,
+    search_fuzzy: bool,
+    search_score: float,
+) -> tuple[dict | None, bool, str]:
+    """Prefer MAL search exact match, then list exact, then stronger fuzzy.
+
+    Returns ``(node, fuzzy, source)`` where ``source`` is ``search``, ``list``, or ``none``.
+    """
+    if search_node is not None and not search_fuzzy:
+        return search_node, False, "search"
+    if list_node is not None and not list_fuzzy:
+        return list_node, False, "list"
+    if list_node is not None and list_score > search_score + 0.05:
+        return list_node, list_fuzzy, "list"
+    if search_node is not None:
+        return search_node, search_fuzzy, "search"
+    if list_node is not None:
+        return list_node, list_fuzzy, "list"
+    return None, False, "none"
 
 
 STATUS_MAP = {
@@ -237,10 +403,26 @@ async def help_command(interaction: discord.Interaction):
         description="Search manga & anime on MyAnimeList, track manga, and get DM'd when something updates.",
         color=discord.Color.blurple()
     )
-    embed.add_field(name="/user <username>",  value="Link your MAL username.",                       inline=False)
-    embed.add_field(name="/manga <title>",    value="Search MAL for a manga.",                       inline=False)
-    embed.add_field(name="/anime <title>",    value="Search MAL for an anime.",                      inline=False)
-    embed.add_field(name="/track <title>",    value=f"Track a manga (max {MAX_TRACKED} per user).", inline=False)
+    embed.add_field(
+        name="/user <username>",
+        value="Link your MAL username (used for PDF export + smarter manga/anime matching).",
+        inline=False,
+    )
+    embed.add_field(
+        name="/manga <title>",
+        value="Search MAL; optional **media** (manhwa/manhua). Uses your manga list when linked.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/anime <title>",
+        value="Search MAL; uses your anime list when linked for pasted list titles.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/track <title>",
+        value=f"Track manga (max {MAX_TRACKED}); optional manhwa/manhua filter like `/manga`.",
+        inline=False,
+    )
     embed.add_field(name="/untrack <title>",  value="Stop tracking a manga (autocomplete).",         inline=False)
     embed.add_field(name="/list",             value="See your full tracking list.",                  inline=False)
     embed.add_field(name="/export",           value="Export your tracking list as a PDF.",           inline=False)
@@ -267,7 +449,16 @@ async def set_user(interaction: discord.Interaction, username: str):
 
 @bot.tree.command(name="manga", description="Search for a manga on MAL")
 @app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
-async def manga(interaction: discord.Interaction, title: str):
+@app_commands.describe(
+    title="Title to search (paste from your MAL list works best if you use /user)",
+    media="Optional: restrict to manhwa or manhua (MAL media_type)",
+)
+@app_commands.choices(media=[
+    app_commands.Choice(name="Any", value="any"),
+    app_commands.Choice(name="Manhwa", value="manhwa"),
+    app_commands.Choice(name="Manhua", value="manhua"),
+])
+async def manga(interaction: discord.Interaction, title: str, media: str | None = None):
     title = sanitize(title)
     if not title:
         await interaction.response.send_message("Give me an actual title.", ephemeral=True)
@@ -275,69 +466,111 @@ async def manga(interaction: discord.Interaction, title: str):
 
     await interaction.response.defer()
 
-    url = (
-        f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit={MAL_SEARCH_LIMIT}'
-        f'&fields=id,title,alternative_titles,main_picture,synopsis,status,num_chapters,mean,authors{{first_name,last_name}}'
+    kind = (media or "any").lower()
+    lim  = MAL_SEARCH_LIMIT_MEDIA if kind != "any" else MAL_SEARCH_LIMIT
+    search_url = (
+        f"https://api.myanimelist.net/v2/manga?q={quote(title)}&limit={lim}"
+        f"&fields={MAL_MANGA_SEARCH_FIELDS}"
     )
-    headers = {'X-MAL-CLIENT-ID': MAL_ID}
+
+    mal_user: str | None = None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT mal_username FROM users WHERE discord_id = $1", interaction.user.id
+        )
+        if row and row["mal_username"]:
+            mal_user = row["mal_username"]
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                await interaction.followup.send("MAL API is not responding right now. Try again later.")
-                return
-            data = await resp.json()
+        search_task = asyncio.create_task(mal_fetch_json(session, search_url))
+        list_task = (
+            asyncio.create_task(mal_paginate_user_manga_nodes(session, mal_user))
+            if mal_user
+            else None
+        )
+        search_data = await search_task
+        list_nodes = await list_task if list_task else []
 
-    raw = data.get('data') or []
-    nodes = [item['node'] for item in raw if item.get('node')]
-    node, fuzzy = pick_best_mal_node(nodes, title)
-    if node is None:
-        await interaction.followup.send("Couldn't find that manga on MAL.")
-        return
-    status   = STATUS_MAP.get(node.get('status', ''), 'Unknown')
-    chapters = node.get('num_chapters', 0)
-    ch_text  = str(chapters) if chapters > 0 else 'Ongoing'
-    synopsis = node.get('synopsis', 'No synopsis available.')
-    score    = node.get('mean')
-    score_text = f"{score}/10" if score else 'N/A'
+        if search_data is None:
+            await interaction.followup.send("MAL API is not responding right now. Try again later.")
+            return
 
-    authors = node.get('authors', [])
+        raw = search_data.get("data") or []
+        search_nodes = [item["node"] for item in raw if item.get("node")]
+
+        ln, lf, ls, l_fb = _pick_manga_with_media(list_nodes, title, kind)
+        sn, sf, ss, s_fb = _pick_manga_with_media(search_nodes, title, kind)
+
+        node, _, src = resolve_manga_choice(ln, lf, ls, sn, sf, ss)
+        if node is None:
+            await interaction.followup.send("Couldn't find that manga on MAL.")
+            return
+
+        if src == "list" or not node.get("synopsis"):
+            detail = await mal_fetch_manga_detail(session, int(node["id"]))
+            if detail:
+                node = detail
+
+    status = STATUS_MAP.get(node.get("status", ""), "Unknown")
+    chapters = node.get("num_chapters", 0)
+    ch_text  = str(chapters) if chapters > 0 else "Ongoing"
+    synopsis = node.get("synopsis", "No synopsis available.")
+    score    = node.get("mean")
+    score_text = f"{score}/10" if score else "N/A"
+
+    authors = node.get("authors", [])
     author_names = []
     for a in authors:
-        person = a.get('node', {})
-        first  = person.get('first_name', '')
-        last   = person.get('last_name', '')
+        person = a.get("node", {})
+        first  = person.get("first_name", "")
+        last   = person.get("last_name", "")
         name   = f"{first} {last}".strip()
         if name:
             author_names.append(name)
-    author_text = ', '.join(author_names[:3]) if author_names else 'Unknown'
+    author_text = ", ".join(author_names[:3]) if author_names else "Unknown"
 
+    mt = str(node.get("media_type", "") or "manga").replace("_", " ").title()
     embed = discord.Embed(
-        title=node['title'],
+        title=node["title"],
         url=f"https://myanimelist.net/manga/{node['id']}",
-        color=discord.Color.blue()
+        color=discord.Color.blue(),
     )
-    if 'main_picture' in node:
-        embed.set_thumbnail(url=node['main_picture']['large'])
+    if "main_picture" in node:
+        embed.set_thumbnail(url=node["main_picture"]["large"])
 
     embed.add_field(
         name="Synopsis",
         value=synopsis[:300] + ("..." if len(synopsis) > 300 else ""),
-        inline=False
+        inline=False,
     )
+    embed.add_field(name="Type",     value=mt,          inline=True)
     embed.add_field(name="Status",   value=status,      inline=True)
-    embed.add_field(name="Chapters", value=ch_text,      inline=True)
-    embed.add_field(name="MAL Score", value=score_text,  inline=True)
-    embed.add_field(name="Author",   value=author_text,  inline=True)
+    embed.add_field(name="Chapters", value=ch_text,     inline=True)
+    embed.add_field(name="MAL Score", value=score_text, inline=True)
+    embed.add_field(name="Author",   value=author_text, inline=True)
 
-    if fuzzy and raw and raw[0].get('node', {}).get('id') != node.get('id'):
-        embed.set_footer(text="No exact title match — showing the closest result (not MAL's first search hit).")
+    fuzzy = not any(_norm_title(c) == _norm_title(title) for c in _titles_from_mal_node(node))
+    foot: list[str] = []
+    if src == "list":
+        foot.append("Matched using your linked MAL manga list (`/user`).")
+    if kind != "any" and (
+        str(node.get("media_type", "")).lower() != kind or s_fb or l_fb
+    ):
+        foot.append("Manhwa/manhua filter: no strict-only hit — showing closest title.")
+    if fuzzy and raw and raw[0].get("node", {}).get("id") != node.get("id"):
+        foot.append("Not MAL search #1 — picked closest title among results.")
+
+    if foot:
+        embed.set_footer(text=" ".join(foot))
 
     await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="anime", description="Search for an anime on MAL")
 @app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
+@app_commands.describe(
+    title="Title to search (paste from your MAL list works best if you use /user)",
+)
 async def anime(interaction: discord.Interaction, title: str):
     title = sanitize(title)
     if not title:
@@ -346,63 +579,102 @@ async def anime(interaction: discord.Interaction, title: str):
 
     await interaction.response.defer()
 
-    url = (
-        f'https://api.myanimelist.net/v2/anime?q={quote(title)}&limit={MAL_SEARCH_LIMIT}'
-        f'&fields=id,title,alternative_titles,main_picture,synopsis,status,num_episodes,mean,studios'
+    search_url = (
+        f"https://api.myanimelist.net/v2/anime?q={quote(title)}&limit={MAL_SEARCH_LIMIT}"
+        f"&fields={MAL_ANIME_SEARCH_FIELDS}"
     )
-    headers = {'X-MAL-CLIENT-ID': MAL_ID}
+
+    mal_user: str | None = None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT mal_username FROM users WHERE discord_id = $1", interaction.user.id
+        )
+        if row and row["mal_username"]:
+            mal_user = row["mal_username"]
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                await interaction.followup.send("MAL API is not responding right now. Try again later.")
-                return
-            data = await resp.json()
+        search_task = asyncio.create_task(mal_fetch_json(session, search_url))
+        list_task = (
+            asyncio.create_task(mal_paginate_user_anime_nodes(session, mal_user))
+            if mal_user
+            else None
+        )
+        search_data = await search_task
+        list_nodes = await list_task if list_task else []
 
-    raw = data.get('data') or []
-    nodes = [item['node'] for item in raw if item.get('node')]
-    node, fuzzy = pick_best_mal_node(nodes, title)
-    if node is None:
-        await interaction.followup.send("Couldn't find that anime on MAL.")
-        return
-    status   = ANIME_STATUS_MAP.get(node.get('status', ''), 'Unknown')
-    episodes = node.get('num_episodes', 0)
-    ep_text  = str(episodes) if episodes > 0 else 'Ongoing'
-    synopsis = node.get('synopsis', 'No synopsis available.')
-    score    = node.get('mean')
-    score_text = f"{score}/10" if score else 'N/A'
+        if search_data is None:
+            await interaction.followup.send("MAL API is not responding right now. Try again later.")
+            return
 
-    studios = node.get('studios', [])
-    studio_names = [s.get('name', '') for s in studios if s.get('name')]
-    studio_text  = ', '.join(studio_names[:3]) if studio_names else 'Unknown'
+        raw = search_data.get("data") or []
+        search_nodes = [item["node"] for item in raw if item.get("node")]
+
+        ln, lf, ls = pick_best_mal_node(list_nodes, title)
+        sn, sf, ss = pick_best_mal_node(search_nodes, title)
+
+        node, _, src = resolve_manga_choice(ln, lf, ls, sn, sf, ss)
+        if node is None:
+            await interaction.followup.send("Couldn't find that anime on MAL.")
+            return
+
+        if src == "list" or not node.get("synopsis"):
+            detail = await mal_fetch_anime_detail(session, int(node["id"]))
+            if detail:
+                node = detail
+
+    status   = ANIME_STATUS_MAP.get(node.get("status", ""), "Unknown")
+    episodes = node.get("num_episodes", 0)
+    ep_text  = str(episodes) if episodes > 0 else "Ongoing"
+    synopsis = node.get("synopsis", "No synopsis available.")
+    score    = node.get("mean")
+    score_text = f"{score}/10" if score else "N/A"
+
+    studios = node.get("studios", [])
+    studio_names = [s.get("name", "") for s in studios if s.get("name")]
+    studio_text  = ", ".join(studio_names[:3]) if studio_names else "Unknown"
 
     embed = discord.Embed(
-        title=node['title'],
+        title=node["title"],
         url=f"https://myanimelist.net/anime/{node['id']}",
-        color=discord.Color.red()
+        color=discord.Color.red(),
     )
-    if 'main_picture' in node:
-        embed.set_thumbnail(url=node['main_picture']['large'])
+    if "main_picture" in node:
+        embed.set_thumbnail(url=node["main_picture"]["large"])
 
     embed.add_field(
         name="Synopsis",
         value=synopsis[:300] + ("..." if len(synopsis) > 300 else ""),
-        inline=False
+        inline=False,
     )
     embed.add_field(name="Status",    value=status,      inline=True)
     embed.add_field(name="Episodes",  value=ep_text,     inline=True)
     embed.add_field(name="MAL Score", value=score_text,  inline=True)
-    embed.add_field(name="Studio",    value=studio_text,  inline=True)
+    embed.add_field(name="Studio",    value=studio_text, inline=True)
 
-    if fuzzy and raw and raw[0].get('node', {}).get('id') != node.get('id'):
-        embed.set_footer(text="No exact title match — showing the closest result (not MAL's first search hit).")
+    fuzzy = not any(_norm_title(c) == _norm_title(title) for c in _titles_from_mal_node(node))
+    foot: list[str] = []
+    if src == "list":
+        foot.append("Matched using your linked MAL anime list (`/user`).")
+    if fuzzy and raw and raw[0].get("node", {}).get("id") != node.get("id"):
+        foot.append("Not MAL search #1 — picked closest title among results.")
+    if foot:
+        embed.set_footer(text=" ".join(foot))
 
     await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="track", description="Track a manga for chapter updates")
 @app_commands.checks.cooldown(1, 5, key=lambda i: i.user.id)
-async def track(interaction: discord.Interaction, title: str):
+@app_commands.describe(
+    title="Title to track (optional manhwa/manhua filter; uses your MAL list if linked)",
+    media="Optional: restrict to manhwa or manhua (MAL media_type)",
+)
+@app_commands.choices(media=[
+    app_commands.Choice(name="Any", value="any"),
+    app_commands.Choice(name="Manhwa", value="manhwa"),
+    app_commands.Choice(name="Manhua", value="manhua"),
+])
+async def track(interaction: discord.Interaction, title: str, media: str | None = None):
     title = sanitize(title)
     if not title:
         await interaction.response.send_message("Give me a title.", ephemeral=True)
@@ -414,6 +686,9 @@ async def track(interaction: discord.Interaction, title: str):
         count = await conn.fetchval(
             "SELECT COUNT(*) FROM tracking WHERE user_id = $1", interaction.user.id
         )
+        user_row = await conn.fetchrow(
+            "SELECT mal_username FROM users WHERE discord_id = $1", interaction.user.id
+        )
 
     if count >= MAX_TRACKED:
         await interaction.followup.send(
@@ -421,25 +696,44 @@ async def track(interaction: discord.Interaction, title: str):
         )
         return
 
-    url = (
-        f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit={MAL_SEARCH_LIMIT}'
-        f'&fields=id,title,alternative_titles,num_chapters,status,updated_at'
+    kind = (media or "any").lower()
+    lim  = MAL_SEARCH_LIMIT_MEDIA if kind != "any" else MAL_SEARCH_LIMIT
+    search_url = (
+        f"https://api.myanimelist.net/v2/manga?q={quote(title)}&limit={lim}"
+        f"&fields={MAL_MANGA_TRACK_SEARCH_FIELDS}"
     )
-    headers = {'X-MAL-CLIENT-ID': MAL_ID}
+
+    mal_user = user_row["mal_username"] if user_row and user_row["mal_username"] else None
 
     async with aiohttp.ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            if resp.status != 200:
-                await interaction.followup.send("MAL API is not responding right now.")
-                return
-            data = await resp.json()
+        search_task = asyncio.create_task(mal_fetch_json(session, search_url))
+        list_task = (
+            asyncio.create_task(mal_paginate_user_manga_nodes(session, mal_user))
+            if mal_user
+            else None
+        )
+        search_data = await search_task
+        list_nodes = await list_task if list_task else []
 
-    raw = data.get('data') or []
-    nodes = [item['node'] for item in raw if item.get('node')]
-    node, fuzzy = pick_best_mal_node(nodes, title)
-    if node is None:
-        await interaction.followup.send("Couldn't find that manga on MAL.")
-        return
+        if search_data is None:
+            await interaction.followup.send("MAL API is not responding right now.")
+            return
+
+        raw = search_data.get("data") or []
+        search_nodes = [item["node"] for item in raw if item.get("node")]
+
+        ln, lf, ls, _ = _pick_manga_with_media(list_nodes, title, kind)
+        sn, sf, ss, _ = _pick_manga_with_media(search_nodes, title, kind)
+
+        node, _, src = resolve_manga_choice(ln, lf, ls, sn, sf, ss)
+        if node is None:
+            await interaction.followup.send("Couldn't find that manga on MAL.")
+            return
+
+        if not node.get("updated_at") or node.get("num_chapters") is None:
+            detail = await mal_fetch_manga_detail(session, int(node["id"]))
+            if detail:
+                node = detail
 
     async with pool.acquire() as conn:
         result = await conn.execute(
@@ -447,15 +741,19 @@ async def track(interaction: discord.Interaction, title: str):
                VALUES ($1, $2, $3, $4, $5)
                ON CONFLICT (user_id, manga_id) DO NOTHING""",
             interaction.user.id,
-            node['id'],
-            node['title'],
-            node.get('num_chapters', 0),
-            node.get('updated_at', '')
+            node["id"],
+            node["title"],
+            node.get("num_chapters", 0),
+            node.get("updated_at", ""),
         )
 
-    hint = ""
-    if fuzzy and raw and raw[0].get('node', {}).get('id') != node.get('id'):
-        hint = " _(Closest match to your search; MAL's first hit was a different title.)_"
+    fuzzy = not any(_norm_title(c) == _norm_title(title) for c in _titles_from_mal_node(node))
+    hint_parts: list[str] = []
+    if src == "list":
+        hint_parts.append("Resolved via your linked MAL manga list (`/user`).")
+    if fuzzy and raw and raw[0].get("node", {}).get("id") != node.get("id"):
+        hint_parts.append("Closest match; MAL's first search hit was different.")
+    hint = (" (" + " ".join(hint_parts) + ")") if hint_parts else ""
 
     if result == "INSERT 0 0":
         await interaction.followup.send(f"You're already tracking **{node['title']}**.{hint}")
