@@ -4,6 +4,8 @@ from discord.ext import tasks
 import os
 import io
 import asyncio
+import unicodedata
+from difflib import SequenceMatcher
 from urllib.parse import quote
 import aiohttp
 import asyncpg
@@ -52,6 +54,68 @@ async def init_db():
 
 def sanitize(text: str, max_len: int = 100) -> str:
     return text.strip().replace('@everyone', '').replace('@here', '')[:max_len]
+
+
+MAL_SEARCH_LIMIT = 10
+
+
+def _norm_title(s: str) -> str:
+    s = unicodedata.normalize("NFKC", (s or "").strip())
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Cf")
+    return " ".join(s.casefold().split())
+
+
+def _titles_from_mal_node(node: dict) -> list[str]:
+    out: list[str] = []
+    t = node.get("title")
+    if t:
+        out.append(str(t))
+    alt = node.get("alternative_titles")
+    if isinstance(alt, dict):
+        for key in ("en", "ja"):
+            v = alt.get(key)
+            if v:
+                out.append(str(v))
+        for syn in alt.get("synonyms") or []:
+            if syn:
+                out.append(str(syn))
+    return out
+
+
+def _title_similarity(query: str, title: str) -> float:
+    nq, nt = _norm_title(query), _norm_title(title)
+    if not nq or not nt:
+        return 0.0
+    if nq == nt:
+        return 1.0
+    if nq in nt or nt in nq:
+        return 0.92
+    return SequenceMatcher(None, nq, nt).ratio()
+
+
+def pick_best_mal_node(nodes: list[dict], query: str) -> tuple[dict | None, bool]:
+    """Pick the best-matching node for ``query``. Returns (node, fuzzy) where
+    ``fuzzy`` is True when no normalized exact match on title or alt names."""
+    if not nodes:
+        return None, False
+    qn = _norm_title(query)
+
+    for node in nodes:
+        for cand in _titles_from_mal_node(node):
+            if _norm_title(cand) == qn:
+                return node, False
+
+    ranked: list[tuple[float, int, dict]] = []
+    for i, node in enumerate(nodes):
+        score = max(
+            (_title_similarity(query, c) for c in _titles_from_mal_node(node)),
+            default=0.0,
+        )
+        ranked.append((score, -i, node))
+    ranked.sort(reverse=True)
+    _, _, best_node = ranked[0]
+    return best_node, True
+
 
 STATUS_MAP = {
     'currently_publishing': 'Ongoing',
@@ -212,8 +276,8 @@ async def manga(interaction: discord.Interaction, title: str):
     await interaction.response.defer()
 
     url = (
-        f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit=1'
-        f'&fields=id,title,main_picture,synopsis,status,num_chapters,mean,authors{{first_name,last_name}}'
+        f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit={MAL_SEARCH_LIMIT}'
+        f'&fields=id,title,alternative_titles,main_picture,synopsis,status,num_chapters,mean,authors{{first_name,last_name}}'
     )
     headers = {'X-MAL-CLIENT-ID': MAL_ID}
 
@@ -224,11 +288,12 @@ async def manga(interaction: discord.Interaction, title: str):
                 return
             data = await resp.json()
 
-    if not data.get('data'):
+    raw = data.get('data') or []
+    nodes = [item['node'] for item in raw if item.get('node')]
+    node, fuzzy = pick_best_mal_node(nodes, title)
+    if node is None:
         await interaction.followup.send("Couldn't find that manga on MAL.")
         return
-
-    node     = data['data'][0]['node']
     status   = STATUS_MAP.get(node.get('status', ''), 'Unknown')
     chapters = node.get('num_chapters', 0)
     ch_text  = str(chapters) if chapters > 0 else 'Ongoing'
@@ -265,6 +330,9 @@ async def manga(interaction: discord.Interaction, title: str):
     embed.add_field(name="MAL Score", value=score_text,  inline=True)
     embed.add_field(name="Author",   value=author_text,  inline=True)
 
+    if fuzzy and raw and raw[0].get('node', {}).get('id') != node.get('id'):
+        embed.set_footer(text="No exact title match — showing the closest result (not MAL's first search hit).")
+
     await interaction.followup.send(embed=embed)
 
 
@@ -279,8 +347,8 @@ async def anime(interaction: discord.Interaction, title: str):
     await interaction.response.defer()
 
     url = (
-        f'https://api.myanimelist.net/v2/anime?q={quote(title)}&limit=1'
-        f'&fields=id,title,main_picture,synopsis,status,num_episodes,mean,studios'
+        f'https://api.myanimelist.net/v2/anime?q={quote(title)}&limit={MAL_SEARCH_LIMIT}'
+        f'&fields=id,title,alternative_titles,main_picture,synopsis,status,num_episodes,mean,studios'
     )
     headers = {'X-MAL-CLIENT-ID': MAL_ID}
 
@@ -291,11 +359,12 @@ async def anime(interaction: discord.Interaction, title: str):
                 return
             data = await resp.json()
 
-    if not data.get('data'):
+    raw = data.get('data') or []
+    nodes = [item['node'] for item in raw if item.get('node')]
+    node, fuzzy = pick_best_mal_node(nodes, title)
+    if node is None:
         await interaction.followup.send("Couldn't find that anime on MAL.")
         return
-
-    node     = data['data'][0]['node']
     status   = ANIME_STATUS_MAP.get(node.get('status', ''), 'Unknown')
     episodes = node.get('num_episodes', 0)
     ep_text  = str(episodes) if episodes > 0 else 'Ongoing'
@@ -325,6 +394,9 @@ async def anime(interaction: discord.Interaction, title: str):
     embed.add_field(name="MAL Score", value=score_text,  inline=True)
     embed.add_field(name="Studio",    value=studio_text,  inline=True)
 
+    if fuzzy and raw and raw[0].get('node', {}).get('id') != node.get('id'):
+        embed.set_footer(text="No exact title match — showing the closest result (not MAL's first search hit).")
+
     await interaction.followup.send(embed=embed)
 
 
@@ -349,7 +421,10 @@ async def track(interaction: discord.Interaction, title: str):
         )
         return
 
-    url     = f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit=1&fields=id,title,num_chapters,status,updated_at'
+    url = (
+        f'https://api.myanimelist.net/v2/manga?q={quote(title)}&limit={MAL_SEARCH_LIMIT}'
+        f'&fields=id,title,alternative_titles,num_chapters,status,updated_at'
+    )
     headers = {'X-MAL-CLIENT-ID': MAL_ID}
 
     async with aiohttp.ClientSession() as session:
@@ -359,11 +434,12 @@ async def track(interaction: discord.Interaction, title: str):
                 return
             data = await resp.json()
 
-    if not data.get('data'):
+    raw = data.get('data') or []
+    nodes = [item['node'] for item in raw if item.get('node')]
+    node, fuzzy = pick_best_mal_node(nodes, title)
+    if node is None:
         await interaction.followup.send("Couldn't find that manga on MAL.")
         return
-
-    node = data['data'][0]['node']
 
     async with pool.acquire() as conn:
         result = await conn.execute(
@@ -377,10 +453,16 @@ async def track(interaction: discord.Interaction, title: str):
             node.get('updated_at', '')
         )
 
+    hint = ""
+    if fuzzy and raw and raw[0].get('node', {}).get('id') != node.get('id'):
+        hint = " _(Closest match to your search; MAL's first hit was a different title.)_"
+
     if result == "INSERT 0 0":
-        await interaction.followup.send(f"You're already tracking **{node['title']}**.")
+        await interaction.followup.send(f"You're already tracking **{node['title']}**.{hint}")
     else:
-        await interaction.followup.send(f"✅ Now tracking **{node['title']}**! I'll DM you when it updates.")
+        await interaction.followup.send(
+            f"✅ Now tracking **{node['title']}**! I'll DM you when it updates.{hint}"
+        )
 
 
 async def untrack_autocomplete(interaction: discord.Interaction, current: str) -> list[app_commands.Choice[str]]:
